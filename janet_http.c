@@ -51,6 +51,8 @@ typedef struct {
 } ReqHandle;
 
 static void rh_free(ReqHandle *rh) {
+  if (rh->easy)
+    curl_easy_cleanup(rh->easy);
   free(rh->url);
   free(rh->method);
   free(rh->body);
@@ -309,7 +311,7 @@ static Janet parse_headers(const char *raw, size_t len) {
     }
 
     const char *colon = memchr(scan, ':', line_len);
-    if (colon) {
+    if (colon && colon > scan) {
       size_t klen = colon - scan;
       const char *vstart = colon + 1;
       size_t vlen = line_len - klen - 1;
@@ -336,7 +338,7 @@ static Janet parse_headers(const char *raw, size_t len) {
 /* --- Helpers --- */
 
 static char *strdup_bytes(const uint8_t *bytes, int32_t len) {
-  char *s = malloc(len + 1);
+  char *s = malloc((size_t)len + 1);
   memcpy(s, bytes, len);
   s[len] = '\0';
   return s;
@@ -557,6 +559,11 @@ static Janet cfun_form_encode(int32_t argc, Janet *argv) {
         curl_easy_escape(NULL, (const char *)ks, janet_string_length(ks));
     char *ev =
         curl_easy_escape(NULL, (const char *)vs, janet_string_length(vs));
+    if (!ek || !ev) {
+      curl_free(ek);
+      curl_free(ev);
+      janet_panic("curl_easy_escape failed");
+    }
     if (!first)
       janet_buffer_push_u8(buf, '&');
     janet_buffer_push_cstring(buf, ek);
