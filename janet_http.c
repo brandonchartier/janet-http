@@ -151,6 +151,32 @@ static void check_completions(MultiState *ms) {
   }
 }
 
+static void handle_socket_events(MultiState *ms, struct epoll_event *events,
+                                 int n) {
+  for (int i = 0; i < n; i++) {
+    int fd = events[i].data.fd;
+    if (fd == ms->wakeup_pipe[0]) {
+      char buf[64];
+      while (read(fd, buf, sizeof(buf)) > 0)
+        ;
+      /* Drive curl to pick up any newly added handles. */
+      int still_running;
+      curl_multi_socket_action(ms->multi, CURL_SOCKET_TIMEOUT, 0,
+                               &still_running);
+      continue;
+    }
+    int ev_bitmask = 0;
+    if (events[i].events & (EPOLLIN | EPOLLHUP))
+      ev_bitmask |= CURL_CSELECT_IN;
+    if (events[i].events & EPOLLOUT)
+      ev_bitmask |= CURL_CSELECT_OUT;
+    if (events[i].events & EPOLLERR)
+      ev_bitmask |= CURL_CSELECT_ERR;
+    int still_running;
+    curl_multi_socket_action(ms->multi, fd, ev_bitmask, &still_running);
+  }
+}
+
 static void *curl_thread(void *arg) {
   MultiState *ms = (MultiState *)arg;
   struct epoll_event events[MAX_EPOLL_EVENTS];
@@ -168,36 +194,13 @@ static void *curl_thread(void *arg) {
       continue;
 
     pthread_mutex_lock(&ms->lock);
-
     if (n == 0) {
       int still_running;
       curl_multi_socket_action(ms->multi, CURL_SOCKET_TIMEOUT, 0,
                                &still_running);
     } else {
-      for (int i = 0; i < n; i++) {
-        int fd = events[i].data.fd;
-        if (fd == ms->wakeup_pipe[0]) {
-          char buf[64];
-          while (read(fd, buf, sizeof(buf)) > 0)
-            ;
-          /* Drive curl to pick up any newly added handles. */
-          int still_running;
-          curl_multi_socket_action(ms->multi, CURL_SOCKET_TIMEOUT, 0,
-                                   &still_running);
-          continue;
-        }
-        int ev_bitmask = 0;
-        if (events[i].events & (EPOLLIN | EPOLLHUP))
-          ev_bitmask |= CURL_CSELECT_IN;
-        if (events[i].events & EPOLLOUT)
-          ev_bitmask |= CURL_CSELECT_OUT;
-        if (events[i].events & EPOLLERR)
-          ev_bitmask |= CURL_CSELECT_ERR;
-        int still_running;
-        curl_multi_socket_action(ms->multi, fd, ev_bitmask, &still_running);
-      }
+      handle_socket_events(ms, events, n);
     }
-
     check_completions(ms);
     pthread_mutex_unlock(&ms->lock);
   }
@@ -271,15 +274,7 @@ static void on_complete(JanetEVGenericMessage msg) {
 
 /* --- Header parsing --- */
 
-static Janet parse_headers(const char *raw, size_t len) {
-  const char *p = raw;
-  const char *end = raw + len;
-
-  while (p < end && *p != '\n')
-    p++;
-  if (p < end)
-    p++;
-
+static int count_header_lines(const char *p, const char *end) {
   int count = 0;
   const char *scan = p;
   while (scan < end) {
@@ -295,9 +290,20 @@ static Janet parse_headers(const char *raw, size_t len) {
       count++;
     scan = nl + 1;
   }
+  return count;
+}
 
-  JanetKV *st = janet_struct_begin(count);
-  scan = p;
+static Janet parse_headers(const char *raw, size_t len) {
+  const char *p = raw;
+  const char *end = raw + len;
+
+  while (p < end && *p != '\n')
+    p++;
+  if (p < end)
+    p++;
+
+  JanetKV *st = janet_struct_begin(count_header_lines(p, end));
+  const char *scan = p;
   while (scan < end) {
     const char *nl = memchr(scan, '\n', end - scan);
     if (!nl)
@@ -346,80 +352,81 @@ static char *strdup_bytes(const uint8_t *bytes, int32_t len) {
 
 /* --- Request construction --- */
 
-static ReqHandle *req_build(const char *method, const char *url, Janet opts) {
-  if (!janet_checktype(opts, JANET_NIL) &&
-      !janet_checktype(opts, JANET_TABLE) &&
-      !janet_checktype(opts, JANET_STRUCT))
-    janet_panicf("expected table or struct for options, got %t", opts);
-
+static ReqHandle *rh_new(const char *method, const char *url) {
   ReqHandle *rh = calloc(1, sizeof(ReqHandle));
-
   rh->easy = curl_easy_init();
   if (!rh->easy) {
     free(rh);
     janet_panic("curl_easy_init failed");
   }
-
   rh->url = strdup(url);
   rh->method = strdup(method);
   rh->follow_redirects = 1;
   rh->max_redirects = 50;
   rh->user_agent = strdup("janet http client");
   rh->keep_alive = 1;
+  return rh;
+}
 
-  if (!janet_checktype(opts, JANET_NIL)) {
-    Janet v;
-    const uint8_t *bytes;
-    int32_t blen;
-    const Janet *items;
-    int32_t items_len;
+static void rh_apply_opts(ReqHandle *rh, Janet opts) {
+  if (janet_checktype(opts, JANET_NIL))
+    return;
+  if (!janet_checktype(opts, JANET_TABLE) &&
+      !janet_checktype(opts, JANET_STRUCT))
+    janet_panicf("expected table or struct for options, got %t", opts);
 
-    v = janet_get(opts, janet_ckeywordv("body"));
-    if (janet_bytes_view(v, &bytes, &blen)) {
-      rh->body = strdup_bytes(bytes, blen);
-      rh->body_len = (size_t)blen;
-    }
+  Janet v;
+  const uint8_t *bytes;
+  int32_t blen;
+  const Janet *items;
+  int32_t items_len;
 
-    v = janet_get(opts, janet_ckeywordv("follow-redirects"));
-    if (!janet_checktype(v, JANET_NIL))
-      rh->follow_redirects = janet_truthy(v);
-
-    v = janet_get(opts, janet_ckeywordv("max-redirects"));
-    if (janet_checktype(v, JANET_NUMBER))
-      rh->max_redirects = (long)janet_unwrap_number(v);
-
-    v = janet_get(opts, janet_ckeywordv("user-agent"));
-    if (janet_bytes_view(v, &bytes, &blen)) {
-      free(rh->user_agent);
-      rh->user_agent = strdup_bytes(bytes, blen);
-    }
-
-    v = janet_get(opts, janet_ckeywordv("keep-alive"));
-    if (!janet_checktype(v, JANET_NIL))
-      rh->keep_alive = janet_truthy(v);
-
-    v = janet_get(opts, janet_ckeywordv("username"));
-    if (janet_bytes_view(v, &bytes, &blen))
-      rh->username = strdup_bytes(bytes, blen);
-
-    v = janet_get(opts, janet_ckeywordv("password"));
-    if (janet_bytes_view(v, &bytes, &blen))
-      rh->password = strdup_bytes(bytes, blen);
-
-    v = janet_get(opts, janet_ckeywordv("headers"));
-    if (janet_indexed_view(v, &items, &items_len)) {
-      struct curl_slist *list = NULL;
-      for (int32_t i = 0; i < items_len; i++) {
-        const uint8_t *hdr;
-        int32_t hdr_len;
-        if (janet_bytes_view(items[i], &hdr, &hdr_len))
-          list = curl_slist_append(list, (const char *)hdr);
-      }
-      rh->req_headers = list;
-    }
+  v = janet_get(opts, janet_ckeywordv("body"));
+  if (janet_bytes_view(v, &bytes, &blen)) {
+    rh->body = strdup_bytes(bytes, blen);
+    rh->body_len = (size_t)blen;
   }
 
-  /* Configure the easy handle. */
+  v = janet_get(opts, janet_ckeywordv("follow-redirects"));
+  if (!janet_checktype(v, JANET_NIL))
+    rh->follow_redirects = janet_truthy(v);
+
+  v = janet_get(opts, janet_ckeywordv("max-redirects"));
+  if (janet_checktype(v, JANET_NUMBER))
+    rh->max_redirects = (long)janet_unwrap_number(v);
+
+  v = janet_get(opts, janet_ckeywordv("user-agent"));
+  if (janet_bytes_view(v, &bytes, &blen)) {
+    free(rh->user_agent);
+    rh->user_agent = strdup_bytes(bytes, blen);
+  }
+
+  v = janet_get(opts, janet_ckeywordv("keep-alive"));
+  if (!janet_checktype(v, JANET_NIL))
+    rh->keep_alive = janet_truthy(v);
+
+  v = janet_get(opts, janet_ckeywordv("username"));
+  if (janet_bytes_view(v, &bytes, &blen))
+    rh->username = strdup_bytes(bytes, blen);
+
+  v = janet_get(opts, janet_ckeywordv("password"));
+  if (janet_bytes_view(v, &bytes, &blen))
+    rh->password = strdup_bytes(bytes, blen);
+
+  v = janet_get(opts, janet_ckeywordv("headers"));
+  if (janet_indexed_view(v, &items, &items_len)) {
+    struct curl_slist *list = NULL;
+    for (int32_t i = 0; i < items_len; i++) {
+      const uint8_t *hdr;
+      int32_t hdr_len;
+      if (janet_bytes_view(items[i], &hdr, &hdr_len))
+        list = curl_slist_append(list, (const char *)hdr);
+    }
+    rh->req_headers = list;
+  }
+}
+
+static void rh_configure_curl(ReqHandle *rh) {
   curl_easy_setopt(rh->easy, CURLOPT_URL, rh->url);
   curl_easy_setopt(rh->easy, CURLOPT_CUSTOMREQUEST, rh->method);
   curl_easy_setopt(rh->easy, CURLOPT_NOPROGRESS, 1L);
@@ -449,7 +456,12 @@ static ReqHandle *req_build(const char *method, const char *url, Janet opts) {
     curl_easy_setopt(rh->easy, CURLOPT_POSTFIELDS, rh->body);
     curl_easy_setopt(rh->easy, CURLOPT_POSTFIELDSIZE, (long)rh->body_len);
   }
+}
 
+static ReqHandle *req_build(const char *method, const char *url, Janet opts) {
+  ReqHandle *rh = rh_new(method, url);
+  rh_apply_opts(rh, opts);
+  rh_configure_curl(rh);
   return rh;
 }
 

@@ -34,6 +34,9 @@
 (let [res (http/options "https://httpbin.org/get")]
   (assert (= 200 (res :status)) "OPTIONS returns 200"))
 
+(let [res (http/trace "https://httpbin.org/get")]
+  (assert (number? (res :status)) "TRACE completes and returns a status"))
+
 (let [res (http/request "GET" "https://httpbin.org/get")]
   (assert (= 200 (res :status)) "request with explicit method works"))
 
@@ -54,6 +57,18 @@
 
 (let [res (http/get "https://httpbin.org/redirect/3" {:follow-redirects false})]
   (assert (= 302 (res :status)) "redirect following can be disabled"))
+
+(let [ok (try (do (http/get "https://httpbin.org/redirect/5" {:max-redirects 2}) true)
+              ([_] false))]
+  (assert (not ok) "max-redirects raises an error when limit is exceeded"))
+
+(let [res (http/get "https://httpbin.org/basic-auth/user/pass"
+            {:username "user" :password "pass"})]
+  (assert (= 200 (res :status)) "basic auth succeeds with correct credentials"))
+
+(let [res (http/get "https://httpbin.org/basic-auth/user/pass"
+            {:username "user" :password "wrong"})]
+  (assert (= 401 (res :status)) "basic auth fails with wrong credentials"))
 
 # ---------------------------------------------------------------------------
 # status codes
