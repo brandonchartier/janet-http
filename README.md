@@ -1,8 +1,9 @@
 # Janet HTTP
 
-A non-blocking HTTP client for Janet, backed by libcurl. Requests run on a worker
-thread so the event loop stays live — PING handlers, timers, and other fibers
-continue while a request is in flight.
+A non-blocking HTTP client for Janet, backed by libcurl. Uses libcurl's multi
+interface with a private epoll loop on a single background thread — the Janet
+event loop stays live regardless of how many requests are in flight, and there
+is no thread-per-request overhead.
 
 `jpm install https://github.com/brandonchartier/janet-http`
 
