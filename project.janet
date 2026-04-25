@@ -10,4 +10,4 @@
   :name "http"
   :source @["janet_http.c"]
   :cflags @["-D_GNU_SOURCE"]
-  :lflags @["-lcurl"])
+  :lflags @["-lcurl" "-lpthread"])

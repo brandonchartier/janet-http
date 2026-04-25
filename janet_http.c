@@ -1,9 +1,14 @@
 #include <janet.h>
 #include <curl/curl.h>
+#include <pthread.h>
+#include <sys/epoll.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 
-/* --- Dynamic buffer for accumulating response data --- */
+/* --- Dynamic buffer --- */
 
 typedef struct {
     char *data;
@@ -22,9 +27,10 @@ static size_t buf_append(char *ptr, size_t size, size_t nmemb, void *ud) {
     return n;
 }
 
-/* --- Request state passed between main thread and worker --- */
+/* --- Per-request state --- */
 
 typedef struct {
+    CURL *easy;
     char *url;
     char *method;
     char *body;
@@ -41,151 +47,213 @@ typedef struct {
     Buf headers_buf;
     char error[CURL_ERROR_SIZE];
     JanetFiber *fiber;
-} Req;
+} ReqHandle;
 
-static void req_free(Req *r) {
-    free(r->url);
-    free(r->method);
-    free(r->body);
-    free(r->user_agent);
-    free(r->username);
-    free(r->password);
-    free(r->body_buf.data);
-    free(r->headers_buf.data);
-    curl_slist_free_all(r->req_headers);
-    free(r);
+static void rh_free(ReqHandle *rh) {
+    free(rh->url);
+    free(rh->method);
+    free(rh->body);
+    free(rh->user_agent);
+    free(rh->username);
+    free(rh->password);
+    free(rh->body_buf.data);
+    free(rh->headers_buf.data);
+    curl_slist_free_all(rh->req_headers);
+    free(rh);
 }
 
-static Req *req_build(const char *method, const char *url, Janet opts) {
-    if (!janet_checktype(opts, JANET_NIL) &&
-        !janet_checktype(opts, JANET_TABLE) &&
-        !janet_checktype(opts, JANET_STRUCT))
-        janet_panicf("expected table or struct for options, got %t", opts);
+/* --- Global curl_multi state --- */
 
-    Req *r = calloc(1, sizeof(Req));
-    r->url = strdup(url);
-    r->method = strdup(method);
-    r->follow_redirects = 1;
-    r->max_redirects = 50;
-    r->user_agent = strdup("janet http client");
-    r->keep_alive = 1;
+typedef struct {
+    CURLM *multi;
+    int epoll_fd;
+    int wakeup_pipe[2];
+    pthread_t thread;
+    pthread_mutex_t lock;
+    JanetVM *vm;
+    volatile int running;
+} MultiState;
 
-    if (janet_checktype(opts, JANET_NIL))
-        return r;
+static MultiState g_ms;
+static pthread_once_t g_init_once = PTHREAD_ONCE_INIT;
 
-    Janet v;
-    const uint8_t *bytes;
-    int32_t blen;
-    const Janet *items;
-    int32_t items_len;
+/* --- Forward declarations --- */
 
-    v = janet_get(opts, janet_ckeywordv("body"));
-    if (janet_bytes_view(v, &bytes, &blen)) {
-        r->body = malloc(blen + 1);
-        memcpy(r->body, bytes, blen);
-        r->body[blen] = '\0';
-        r->body_len = (size_t)blen;
+static void on_complete(JanetEVGenericMessage msg);
+static void *curl_thread(void *arg);
+static Janet parse_headers(const char *raw, size_t len);
+
+/* --- curl callbacks (called from within background thread, lock held) --- */
+
+static int socket_cb(CURL *easy, curl_socket_t s, int what,
+                     void *userp, void *socketp) {
+    (void)easy;
+    MultiState *ms = (MultiState *)userp;
+
+    if (what == CURL_POLL_REMOVE) {
+        epoll_ctl(ms->epoll_fd, EPOLL_CTL_DEL, (int)s, NULL);
+    } else {
+        struct epoll_event ev = {0};
+        if (what == CURL_POLL_IN)
+            ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
+        else if (what == CURL_POLL_OUT)
+            ev.events = EPOLLOUT | EPOLLERR | EPOLLHUP;
+        else
+            ev.events = EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP;
+        ev.data.fd = (int)s;
+        int op = socketp ? EPOLL_CTL_MOD : EPOLL_CTL_ADD;
+        epoll_ctl(ms->epoll_fd, op, (int)s, &ev);
+        curl_multi_assign(ms->multi, s, (void *)1);
     }
+    return 0;
+}
 
-    v = janet_get(opts, janet_ckeywordv("follow-redirects"));
-    if (!janet_checktype(v, JANET_NIL))
-        r->follow_redirects = janet_truthy(v);
+static int timer_cb(CURLM *multi, long timeout_ms, void *userp) {
+    (void)multi;
+    (void)timeout_ms;
+    MultiState *ms = (MultiState *)userp;
+    char byte = 0;
+    /* Fire-and-forget: if the pipe is full the thread is already active. */
+    write(ms->wakeup_pipe[1], &byte, 1);
+    return 0;
+}
 
-    v = janet_get(opts, janet_ckeywordv("max-redirects"));
-    if (janet_checktype(v, JANET_NUMBER))
-        r->max_redirects = (long)janet_unwrap_number(v);
+/* --- Background thread --- */
 
-    v = janet_get(opts, janet_ckeywordv("user-agent"));
-    if (janet_bytes_view(v, &bytes, &blen)) {
-        free(r->user_agent);
-        r->user_agent = malloc(blen + 1);
-        memcpy(r->user_agent, bytes, blen);
-        r->user_agent[blen] = '\0';
+#define MAX_EPOLL_EVENTS 64
+
+static void check_completions(MultiState *ms) {
+    int msgs_left;
+    CURLMsg *msg;
+    while ((msg = curl_multi_info_read(ms->multi, &msgs_left))) {
+        if (msg->msg != CURLMSG_DONE) continue;
+
+        ReqHandle *rh = NULL;
+        curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE, &rh);
+
+        if (msg->data.result == CURLE_OK)
+            curl_easy_getinfo(msg->easy_handle, CURLINFO_RESPONSE_CODE, &rh->status);
+        else if (!rh->error[0])
+            strncpy(rh->error, curl_easy_strerror(msg->data.result), CURL_ERROR_SIZE - 1);
+
+        curl_multi_remove_handle(ms->multi, msg->easy_handle);
+        curl_easy_cleanup(msg->easy_handle);
+        rh->easy = NULL;
+
+        JanetEVGenericMessage ev_msg = {0};
+        ev_msg.argp = rh;
+        janet_ev_post_event(ms->vm, on_complete, ev_msg);
     }
+}
 
-    v = janet_get(opts, janet_ckeywordv("keep-alive"));
-    if (!janet_checktype(v, JANET_NIL))
-        r->keep_alive = janet_truthy(v);
+static void *curl_thread(void *arg) {
+    MultiState *ms = (MultiState *)arg;
+    struct epoll_event events[MAX_EPOLL_EVENTS];
 
-    v = janet_get(opts, janet_ckeywordv("username"));
-    if (janet_bytes_view(v, &bytes, &blen)) {
-        r->username = malloc(blen + 1);
-        memcpy(r->username, bytes, blen);
-        r->username[blen] = '\0';
-    }
+    while (ms->running) {
+        long timeout_ms = -1;
+        pthread_mutex_lock(&ms->lock);
+        curl_multi_timeout(ms->multi, &timeout_ms);
+        pthread_mutex_unlock(&ms->lock);
 
-    v = janet_get(opts, janet_ckeywordv("password"));
-    if (janet_bytes_view(v, &bytes, &blen)) {
-        r->password = malloc(blen + 1);
-        memcpy(r->password, bytes, blen);
-        r->password[blen] = '\0';
-    }
+        int wait_ms = (timeout_ms < 0 || timeout_ms > 1000) ? 1000 : (int)timeout_ms;
+        int n = epoll_wait(ms->epoll_fd, events, MAX_EPOLL_EVENTS, wait_ms);
+        if (n < 0 && errno == EINTR) continue;
 
-    v = janet_get(opts, janet_ckeywordv("headers"));
-    if (janet_indexed_view(v, &items, &items_len)) {
-        struct curl_slist *list = NULL;
-        for (int32_t i = 0; i < items_len; i++) {
-            const uint8_t *hdr;
-            int32_t hdr_len;
-            if (janet_bytes_view(items[i], &hdr, &hdr_len))
-                list = curl_slist_append(list, (const char *)hdr);
+        pthread_mutex_lock(&ms->lock);
+
+        if (n == 0) {
+            int still_running;
+            curl_multi_socket_action(ms->multi, CURL_SOCKET_TIMEOUT, 0, &still_running);
+        } else {
+            for (int i = 0; i < n; i++) {
+                int fd = events[i].data.fd;
+                if (fd == ms->wakeup_pipe[0]) {
+                    char buf[64];
+                    while (read(fd, buf, sizeof(buf)) > 0);
+                    /* Drive curl to pick up any newly added handles. */
+                    int still_running;
+                    curl_multi_socket_action(ms->multi, CURL_SOCKET_TIMEOUT, 0, &still_running);
+                    continue;
+                }
+                int ev_bitmask = 0;
+                if (events[i].events & (EPOLLIN | EPOLLHUP))  ev_bitmask |= CURL_CSELECT_IN;
+                if (events[i].events & EPOLLOUT)              ev_bitmask |= CURL_CSELECT_OUT;
+                if (events[i].events & EPOLLERR)              ev_bitmask |= CURL_CSELECT_ERR;
+                int still_running;
+                curl_multi_socket_action(ms->multi, fd, ev_bitmask, &still_running);
+            }
         }
-        r->req_headers = list;
-    }
 
-    return r;
+        check_completions(ms);
+        pthread_mutex_unlock(&ms->lock);
+    }
+    return NULL;
 }
 
-/* --- Background worker: no Janet API calls permitted --- */
+/* --- Initialization (called once via pthread_once) --- */
 
-static JanetEVGenericMessage do_request(JanetEVGenericMessage msg) {
-    Req *r = (Req *)msg.argp;
+static void multi_init(void) {
+    g_ms.vm = janet_local_vm();
+    g_ms.multi = curl_multi_init();
 
-    CURL *curl = curl_easy_init();
-    if (!curl) {
-        snprintf(r->error, CURL_ERROR_SIZE, "curl_easy_init failed");
-        return msg;
+    g_ms.epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+    if (g_ms.epoll_fd < 0) janet_panic("epoll_create1 failed");
+
+    if (pipe(g_ms.wakeup_pipe) < 0) janet_panic("pipe failed");
+    fcntl(g_ms.wakeup_pipe[0], F_SETFL, O_NONBLOCK);
+    fcntl(g_ms.wakeup_pipe[1], F_SETFL, O_NONBLOCK);
+
+    struct epoll_event ev = {.events = EPOLLIN, .data.fd = g_ms.wakeup_pipe[0]};
+    epoll_ctl(g_ms.epoll_fd, EPOLL_CTL_ADD, g_ms.wakeup_pipe[0], &ev);
+
+    curl_multi_setopt(g_ms.multi, CURLMOPT_SOCKETFUNCTION, socket_cb);
+    curl_multi_setopt(g_ms.multi, CURLMOPT_SOCKETDATA, &g_ms);
+    curl_multi_setopt(g_ms.multi, CURLMOPT_TIMERFUNCTION, timer_cb);
+    curl_multi_setopt(g_ms.multi, CURLMOPT_TIMERDATA, &g_ms);
+
+    pthread_mutex_init(&g_ms.lock, NULL);
+    g_ms.running = 1;
+    pthread_create(&g_ms.thread, NULL, curl_thread, &g_ms);
+}
+
+/* --- Main-thread completion callback --- */
+
+static void on_complete(JanetEVGenericMessage msg) {
+    ReqHandle *rh = (ReqHandle *)msg.argp;
+    JanetFiber *fiber = rh->fiber;
+
+    janet_ev_dec_refcount();
+
+    if (!janet_fiber_can_resume(fiber)) {
+        janet_gcunroot(janet_wrap_fiber(fiber));
+        rh_free(rh);
+        return;
     }
 
-    curl_easy_setopt(curl, CURLOPT_URL, r->url);
-    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, r->method);
-    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 1L);
-    curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, r->error);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, buf_append);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &r->body_buf);
-    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, buf_append);
-    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &r->headers_buf);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, (long)r->follow_redirects);
-    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, r->max_redirects);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, r->user_agent);
-    curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, (long)r->keep_alive);
-
-    if (r->username) curl_easy_setopt(curl, CURLOPT_USERNAME, r->username);
-    if (r->password) curl_easy_setopt(curl, CURLOPT_PASSWORD, r->password);
-    if (r->req_headers) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, r->req_headers);
-
-    if (strcmp(r->method, "HEAD") == 0)
-        curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
-
-    if (r->body) {
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, r->body);
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)r->body_len);
+    if (rh->error[0]) {
+        janet_cancel(fiber, janet_cstringv(rh->error));
+    } else {
+        JanetTable *t = janet_table(3);
+        janet_table_put(t, janet_ckeywordv("status"),
+            janet_wrap_integer((int32_t)rh->status));
+        janet_table_put(t, janet_ckeywordv("body"),
+            janet_wrap_string(janet_string(
+                (const uint8_t *)(rh->body_buf.data ? rh->body_buf.data : ""),
+                (int32_t)rh->body_buf.len)));
+        janet_table_put(t, janet_ckeywordv("headers"),
+            rh->headers_buf.data
+                ? parse_headers(rh->headers_buf.data, rh->headers_buf.len)
+                : janet_wrap_struct(janet_struct_end(janet_struct_begin(0))));
+        janet_schedule(fiber, janet_wrap_table(t));
     }
 
-    CURLcode res = curl_easy_perform(curl);
-    if (res == CURLE_OK)
-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &r->status);
-    else if (!r->error[0])
-        strncpy(r->error, curl_easy_strerror(res), CURL_ERROR_SIZE - 1);
-
-    curl_easy_cleanup(curl);
-    return msg;
+    janet_gcunroot(janet_wrap_fiber(fiber));
+    rh_free(rh);
 }
 
 /* --- Header parsing --- */
 
-/* curl delivers raw HTTP headers: status line, then "Key: Value\r\n" lines,
- * ending with a blank line. Parse into a Janet struct with lowercased keys. */
 static Janet parse_headers(const char *raw, size_t len) {
     const char *p = raw;
     const char *end = raw + len;
@@ -219,7 +287,6 @@ static Janet parse_headers(const char *raw, size_t len) {
             const char *vstart = colon + 1;
             size_t vlen = line_len - klen - 1;
             while (vlen > 0 && *vstart == ' ') { vstart++; vlen--; }
-
             char *kbuf = malloc(klen);
             for (size_t i = 0; i < klen; i++)
                 kbuf[i] = (char)(scan[i] >= 'A' && scan[i] <= 'Z' ? scan[i] + 32 : scan[i]);
@@ -233,47 +300,134 @@ static Janet parse_headers(const char *raw, size_t len) {
     return janet_wrap_struct(janet_struct_end(st));
 }
 
-/* --- Main-thread completion callback --- */
+/* --- Request construction --- */
 
-static void on_complete(JanetEVGenericMessage msg) {
-    Req *r = (Req *)msg.argp;
-    JanetFiber *fiber = r->fiber;
+static ReqHandle *req_build(const char *method, const char *url, Janet opts) {
+    if (!janet_checktype(opts, JANET_NIL) &&
+        !janet_checktype(opts, JANET_TABLE) &&
+        !janet_checktype(opts, JANET_STRUCT))
+        janet_panicf("expected table or struct for options, got %t", opts);
 
-    if (!janet_fiber_can_resume(fiber)) {
-        janet_gcunroot(janet_wrap_fiber(fiber));
-        req_free(r);
-        return;
+    ReqHandle *rh = calloc(1, sizeof(ReqHandle));
+
+    rh->easy = curl_easy_init();
+    if (!rh->easy) {
+        free(rh);
+        janet_panic("curl_easy_init failed");
     }
 
-    if (r->error[0]) {
-        janet_cancel(fiber, janet_cstringv(r->error));
-    } else {
-        JanetTable *t = janet_table(3);
-        janet_table_put(t, janet_ckeywordv("status"),
-            janet_wrap_integer((int32_t)r->status));
-        janet_table_put(t, janet_ckeywordv("body"),
-            janet_wrap_string(janet_string(
-                (const uint8_t *)(r->body_buf.data ? r->body_buf.data : ""),
-                (int32_t)r->body_buf.len)));
-        janet_table_put(t, janet_ckeywordv("headers"),
-            r->headers_buf.data
-                ? parse_headers(r->headers_buf.data, r->headers_buf.len)
-                : janet_wrap_struct(janet_struct_end(janet_struct_begin(0))));
-        janet_schedule(fiber, janet_wrap_table(t));
+    rh->url = strdup(url);
+    rh->method = strdup(method);
+    rh->follow_redirects = 1;
+    rh->max_redirects = 50;
+    rh->user_agent = strdup("janet http client");
+    rh->keep_alive = 1;
+
+    if (!janet_checktype(opts, JANET_NIL)) {
+        Janet v;
+        const uint8_t *bytes;
+        int32_t blen;
+        const Janet *items;
+        int32_t items_len;
+
+        v = janet_get(opts, janet_ckeywordv("body"));
+        if (janet_bytes_view(v, &bytes, &blen)) {
+            rh->body = malloc(blen + 1);
+            memcpy(rh->body, bytes, blen);
+            rh->body[blen] = '\0';
+            rh->body_len = (size_t)blen;
+        }
+
+        v = janet_get(opts, janet_ckeywordv("follow-redirects"));
+        if (!janet_checktype(v, JANET_NIL)) rh->follow_redirects = janet_truthy(v);
+
+        v = janet_get(opts, janet_ckeywordv("max-redirects"));
+        if (janet_checktype(v, JANET_NUMBER)) rh->max_redirects = (long)janet_unwrap_number(v);
+
+        v = janet_get(opts, janet_ckeywordv("user-agent"));
+        if (janet_bytes_view(v, &bytes, &blen)) {
+            free(rh->user_agent);
+            rh->user_agent = malloc(blen + 1);
+            memcpy(rh->user_agent, bytes, blen);
+            rh->user_agent[blen] = '\0';
+        }
+
+        v = janet_get(opts, janet_ckeywordv("keep-alive"));
+        if (!janet_checktype(v, JANET_NIL)) rh->keep_alive = janet_truthy(v);
+
+        v = janet_get(opts, janet_ckeywordv("username"));
+        if (janet_bytes_view(v, &bytes, &blen)) {
+            rh->username = malloc(blen + 1);
+            memcpy(rh->username, bytes, blen);
+            rh->username[blen] = '\0';
+        }
+
+        v = janet_get(opts, janet_ckeywordv("password"));
+        if (janet_bytes_view(v, &bytes, &blen)) {
+            rh->password = malloc(blen + 1);
+            memcpy(rh->password, bytes, blen);
+            rh->password[blen] = '\0';
+        }
+
+        v = janet_get(opts, janet_ckeywordv("headers"));
+        if (janet_indexed_view(v, &items, &items_len)) {
+            struct curl_slist *list = NULL;
+            for (int32_t i = 0; i < items_len; i++) {
+                const uint8_t *hdr;
+                int32_t hdr_len;
+                if (janet_bytes_view(items[i], &hdr, &hdr_len))
+                    list = curl_slist_append(list, (const char *)hdr);
+            }
+            rh->req_headers = list;
+        }
     }
 
-    janet_gcunroot(janet_wrap_fiber(fiber));
-    req_free(r);
+    /* Configure the easy handle. */
+    curl_easy_setopt(rh->easy, CURLOPT_URL, rh->url);
+    curl_easy_setopt(rh->easy, CURLOPT_CUSTOMREQUEST, rh->method);
+    curl_easy_setopt(rh->easy, CURLOPT_NOPROGRESS, 1L);
+    curl_easy_setopt(rh->easy, CURLOPT_ERRORBUFFER, rh->error);
+    curl_easy_setopt(rh->easy, CURLOPT_WRITEFUNCTION, buf_append);
+    curl_easy_setopt(rh->easy, CURLOPT_WRITEDATA, &rh->body_buf);
+    curl_easy_setopt(rh->easy, CURLOPT_HEADERFUNCTION, buf_append);
+    curl_easy_setopt(rh->easy, CURLOPT_HEADERDATA, &rh->headers_buf);
+    curl_easy_setopt(rh->easy, CURLOPT_FOLLOWLOCATION, (long)rh->follow_redirects);
+    curl_easy_setopt(rh->easy, CURLOPT_MAXREDIRS, rh->max_redirects);
+    curl_easy_setopt(rh->easy, CURLOPT_USERAGENT, rh->user_agent);
+    curl_easy_setopt(rh->easy, CURLOPT_TCP_KEEPALIVE, (long)rh->keep_alive);
+    curl_easy_setopt(rh->easy, CURLOPT_PRIVATE, rh);
+
+    if (rh->username) curl_easy_setopt(rh->easy, CURLOPT_USERNAME, rh->username);
+    if (rh->password) curl_easy_setopt(rh->easy, CURLOPT_PASSWORD, rh->password);
+    if (rh->req_headers) curl_easy_setopt(rh->easy, CURLOPT_HTTPHEADER, rh->req_headers);
+
+    if (strcmp(rh->method, "HEAD") == 0)
+        curl_easy_setopt(rh->easy, CURLOPT_NOBODY, 1L);
+
+    if (rh->body) {
+        curl_easy_setopt(rh->easy, CURLOPT_POSTFIELDS, rh->body);
+        curl_easy_setopt(rh->easy, CURLOPT_POSTFIELDSIZE, (long)rh->body_len);
+    }
+
+    return rh;
 }
 
 /* --- Request dispatch --- */
 
-static JANET_NO_RETURN void start_request(Req *r) {
-    r->fiber = janet_root_fiber();
-    janet_gcroot(janet_wrap_fiber(r->fiber));
-    JanetEVGenericMessage msg = {0};
-    msg.argp = r;
-    janet_ev_threaded_call(do_request, msg, on_complete);
+static JANET_NO_RETURN void start_request(ReqHandle *rh) {
+    pthread_once(&g_init_once, multi_init);
+
+    rh->fiber = janet_root_fiber();
+    janet_gcroot(janet_wrap_fiber(rh->fiber));
+    janet_ev_inc_refcount();
+
+    pthread_mutex_lock(&g_ms.lock);
+    curl_multi_add_handle(g_ms.multi, rh->easy);
+    pthread_mutex_unlock(&g_ms.lock);
+
+    char byte = 0;
+    write(g_ms.wakeup_pipe[1], &byte, 1);
+
     janet_await();
 }
 
