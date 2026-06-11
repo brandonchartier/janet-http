@@ -48,6 +48,18 @@
             {:headers ["X-Test-Header: janet-http"]})]
   (assert (string/find "janet-http" (res :body)) "custom request header was sent"))
 
+# A header given as a buffer is length-copied and delivered intact (regression
+# for the original out-of-bounds read on non-NUL-terminated buffers).
+(let [res (http/get "https://httpbin.org/headers"
+            {:headers [@"X-Buf-Header: from-buffer"]})]
+  (assert (string/find "from-buffer" (res :body)) "buffer header was sent"))
+
+# Non-string/buffer header entries are skipped; valid ones still go through.
+(let [res (http/get "https://httpbin.org/headers"
+            {:headers [42 "X-Real: yes"]})]
+  (assert (= 200 (res :status)) "non-string header entry does not abort the request")
+  (assert (string/find "yes" (res :body)) "valid header alongside a skipped one was sent"))
+
 (let [res (http/get "https://httpbin.org/user-agent"
             {:user-agent "test-agent/1.0"})]
   (assert (string/find "test-agent" (res :body)) "custom user-agent was sent"))
@@ -61,6 +73,13 @@
 (let [ok (try (do (http/get "https://httpbin.org/redirect/5" {:max-redirects 2}) true)
               ([_] false))]
   (assert (not ok) "max-redirects raises an error when limit is exceeded"))
+
+# A redirect to a non-http(s) scheme must be blocked (CURLOPT_REDIR_PROTOCOLS_STR),
+# not just a non-http(s) scheme given as the initial URL.
+(let [ok (try (do (http/get "https://httpbin.org/redirect-to?url=file:///etc/passwd")
+                  true)
+              ([_] false))]
+  (assert (not ok) "redirect to a non-http(s) scheme is rejected"))
 
 (let [res (http/get "https://httpbin.org/basic-auth/user/pass"
             {:username "user" :password "pass"})]
@@ -107,6 +126,68 @@
 (let [ok (try (do (http/get "https://does-not-exist.invalid") true)
               ([_] false))]
   (assert (not ok) "bad host raises an error"))
+
+# ---------------------------------------------------------------------------
+# input validation
+# ---------------------------------------------------------------------------
+
+(let [ok (try (do (http/get "file:///etc/passwd") true)
+              ([_] false))]
+  (assert (not ok) "non-http(s) schemes are rejected"))
+
+(let [ok (try (do (http/get "https://example.com/\r\nHost: evil") true)
+              ([_] false))]
+  (assert (not ok) "url with embedded CR/LF is rejected"))
+
+(let [ok (try (do (http/get "https://exa\x00mple.com/") true)
+              ([_] false))]
+  (assert (not ok) "url with embedded NUL is rejected"))
+
+(let [ok (try (do (http/request "GET\r\nEvil: 1" "https://example.com/") true)
+              ([_] false))]
+  (assert (not ok) "method with embedded CR/LF is rejected"))
+
+(let [ok (try (do (http/get "https://example.com"
+                    {:headers ["X-Evil: a\r\nX-Injected: yes"]})
+                  true)
+              ([_] false))]
+  (assert (not ok) "header with embedded CR/LF is rejected"))
+
+(let [ok (try (do (http/get "https://example.com"
+                    {:user-agent "Eve\r\nX-Injected: yes"})
+                  true)
+              ([_] false))]
+  (assert (not ok) "user-agent with embedded CR/LF is rejected"))
+
+# Buffers are mutable and not NUL-terminated — the input class behind the
+# original out-of-bounds read. The same validation must apply to them.
+(let [ok (try (do (http/get "https://example.com"
+                    {:headers [@"X-Evil: a\r\nX-Injected: yes"]})
+                  true)
+              ([_] false))]
+  (assert (not ok) "header given as a buffer with CR/LF is rejected"))
+
+(let [ok (try (do (http/get "https://example.com"
+                    {:user-agent @"Eve\r\nX-Injected: yes"})
+                  true)
+              ([_] false))]
+  (assert (not ok) "user-agent given as a buffer with CR/LF is rejected"))
+
+# NUL is the truncation vector specifically, distinct from CR/LF.
+(let [ok (try (do (http/get "https://example.com"
+                    {:headers ["X-Evil: a\x00b"]})
+                  true)
+              ([_] false))]
+  (assert (not ok) "header with embedded NUL is rejected"))
+
+(let [ok (try (do (http/get "https://example.com"
+                    {:user-agent "Eve\x00B"})
+                  true)
+              ([_] false))]
+  (assert (not ok) "user-agent with embedded NUL is rejected"))
+
+(assert (= "" (http/url-encode @""))
+        "url-encode of an empty buffer is an empty string")
 
 # ---------------------------------------------------------------------------
 # concurrency — the whole point

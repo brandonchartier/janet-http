@@ -350,6 +350,25 @@ static char *strdup_bytes(const uint8_t *bytes, int32_t len) {
   return s;
 }
 
+/* True if the bytes contain a NUL, CR, or LF. Such bytes would either truncate
+   a value handed to libcurl as a C string or smuggle extra lines into the
+   request, so they are rejected wherever user input becomes a request field. */
+static int has_ctl_chars(const uint8_t *bytes, int32_t len) {
+  return memchr(bytes, '\0', len) || memchr(bytes, '\r', len) ||
+         memchr(bytes, '\n', len);
+}
+
+/* Fetch a string argument, rejecting embedded NUL/CR/LF. A NUL would truncate
+   the URL or method when handed to libcurl as a C string; CR/LF in the method
+   would be written straight into the request line. */
+static const char *checked_string(Janet *argv, int32_t n, const char *what) {
+  JanetString s = janet_getstring(argv, n);
+  int32_t len = janet_string_length(s);
+  if (has_ctl_chars(s, len))
+    janet_panicf("%s contains an embedded NUL, CR, or LF", what);
+  return (const char *)s;
+}
+
 /* --- Request construction --- */
 
 static ReqHandle *rh_new(const char *method, const char *url) {
@@ -397,6 +416,10 @@ static void rh_apply_opts(ReqHandle *rh, Janet opts) {
 
   v = janet_get(opts, janet_ckeywordv("user-agent"));
   if (janet_bytes_view(v, &bytes, &blen)) {
+    /* CURLOPT_USERAGENT becomes a request header; reject NUL/CR/LF so a
+       caller-supplied user agent cannot truncate it or inject header lines. */
+    if (has_ctl_chars(bytes, blen))
+      janet_panic("user-agent contains an embedded NUL, CR, or LF");
     free(rh->user_agent);
     rh->user_agent = strdup_bytes(bytes, blen);
   }
@@ -419,8 +442,18 @@ static void rh_apply_opts(ReqHandle *rh, Janet opts) {
     for (int32_t i = 0; i < items_len; i++) {
       const uint8_t *hdr;
       int32_t hdr_len;
-      if (janet_bytes_view(items[i], &hdr, &hdr_len))
-        list = curl_slist_append(list, (const char *)hdr);
+      if (!janet_bytes_view(items[i], &hdr, &hdr_len))
+        continue;
+      /* Janet buffers are not NUL-terminated; copy by length so
+         curl_slist_append cannot read past the bytes. Reject embedded NUL/CR/LF
+         so a header value cannot be truncated or smuggle extra header lines. */
+      if (has_ctl_chars(hdr, hdr_len)) {
+        curl_slist_free_all(list);
+        janet_panic("header contains an embedded NUL, CR, or LF");
+      }
+      char *h = strdup_bytes(hdr, hdr_len);
+      list = curl_slist_append(list, h);
+      free(h);
     }
     rh->req_headers = list;
   }
@@ -428,6 +461,9 @@ static void rh_apply_opts(ReqHandle *rh, Janet opts) {
 
 static void rh_configure_curl(ReqHandle *rh) {
   curl_easy_setopt(rh->easy, CURLOPT_URL, rh->url);
+  /* Restrict to HTTP(S); libcurl otherwise honors file://, gopher://, etc. */
+  curl_easy_setopt(rh->easy, CURLOPT_PROTOCOLS_STR, "http,https");
+  curl_easy_setopt(rh->easy, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
   curl_easy_setopt(rh->easy, CURLOPT_CUSTOMREQUEST, rh->method);
   curl_easy_setopt(rh->easy, CURLOPT_NOPROGRESS, 1L);
   curl_easy_setopt(rh->easy, CURLOPT_ERRORBUFFER, rh->error);
@@ -486,7 +522,7 @@ static JANET_NO_RETURN void start_request(ReqHandle *rh) {
 
 static JANET_NO_RETURN void dispatch(const char *method, int32_t argc,
                                      Janet *argv) {
-  start_request(req_build(method, (const char *)janet_getstring(argv, 0),
+  start_request(req_build(method, checked_string(argv, 0, "url"),
                           argc > 1 ? argv[1] : janet_wrap_nil()));
 }
 
@@ -494,8 +530,8 @@ static JANET_NO_RETURN void dispatch(const char *method, int32_t argc,
 
 static Janet cfun_request(int32_t argc, Janet *argv) {
   janet_arity(argc, 2, 3);
-  start_request(req_build((const char *)janet_getstring(argv, 0),
-                          (const char *)janet_getstring(argv, 1),
+  start_request(req_build(checked_string(argv, 0, "method"),
+                          checked_string(argv, 1, "url"),
                           argc > 2 ? argv[2] : janet_wrap_nil()));
 }
 
@@ -545,6 +581,10 @@ static Janet cfun_url_encode(int32_t argc, Janet *argv) {
   int32_t len;
   if (!janet_bytes_view(argv[0], &s, &len))
     janet_panicf("expected string or buffer, got %t", argv[0]);
+  /* curl_easy_escape treats length 0 as "call strlen", which would read past a
+     non-NUL-terminated Janet buffer; an empty input encodes to an empty string. */
+  if (len == 0)
+    return janet_cstringv("");
   char *encoded = curl_easy_escape(NULL, (const char *)s, (int)len);
   if (!encoded)
     janet_panic("curl_easy_escape failed");
