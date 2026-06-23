@@ -1,3 +1,5 @@
+.PHONY: setup deps build test
+
 setup:
 	apt-get install -y libcurl4-openssl-dev
 
@@ -8,4 +10,4 @@ build: deps
 	jpm build
 
 test: build
-	jpm test
+	./run-tests.sh
