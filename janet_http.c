@@ -9,8 +9,6 @@
 #include <sys/epoll.h>
 #include <unistd.h>
 
-/* --- Dynamic buffer --- */
-
 typedef struct {
   char *data;
   size_t len;
@@ -33,8 +31,6 @@ static size_t buf_append(char *ptr, size_t size, size_t nmemb, void *ud) {
   buf->data[buf->len] = '\0';
   return n;
 }
-
-/* --- Per-request state --- */
 
 typedef struct {
   CURL *easy;
@@ -72,8 +68,6 @@ static void rh_free(ReqHandle *rh) {
   free(rh);
 }
 
-/* --- Global curl_multi state --- */
-
 typedef struct {
   CURLM *multi;
   int epoll_fd;
@@ -87,14 +81,12 @@ typedef struct {
 static MultiState g_ms;
 static pthread_once_t g_init_once = PTHREAD_ONCE_INIT;
 
-/* --- Forward declarations --- */
-
 static void on_complete(JanetEVGenericMessage msg);
 static void *curl_thread(void *arg);
 static Janet parse_headers(const char *raw, size_t len);
 
-/* --- curl callbacks (called from within background thread, lock held) --- */
-
+/* socket_cb and timer_cb are invoked by curl from inside curl_multi_* calls,
+   always with g_ms.lock already held. */
 static int socket_cb(CURL *easy, curl_socket_t s, int what, void *userp,
                      void *socketp) {
   (void)easy;
@@ -134,8 +126,6 @@ static int timer_cb(CURLM *multi, long timeout_ms, void *userp) {
   wake_curl_thread(ms->wakeup_pipe[1]);
   return 0;
 }
-
-/* --- Background thread --- */
 
 #define MAX_EPOLL_EVENTS 64
 
@@ -221,8 +211,6 @@ static void *curl_thread(void *arg) {
   return NULL;
 }
 
-/* --- Initialization (called once via pthread_once) --- */
-
 static void multi_init(void) {
   g_ms.vm = janet_local_vm();
   g_ms.multi = curl_multi_init();
@@ -249,8 +237,8 @@ static void multi_init(void) {
   pthread_create(&g_ms.thread, NULL, curl_thread, &g_ms);
 }
 
-/* --- Main-thread completion callback --- */
-
+/* Runs on the Janet thread, posted by the curl thread via janet_ev_post_event,
+   so it is safe to build and schedule Janet values here. */
 static void on_complete(JanetEVGenericMessage msg) {
   ReqHandle *rh = (ReqHandle *)msg.argp;
   JanetFiber *fiber = rh->fiber;
@@ -285,8 +273,6 @@ static void on_complete(JanetEVGenericMessage msg) {
   janet_gcunroot(janet_wrap_fiber(fiber));
   rh_free(rh);
 }
-
-/* --- Header parsing --- */
 
 /* Length of the line at scan, excluding any trailing CRLF/LF, and advance
    *next past the newline (or to end for the final line). */
@@ -351,8 +337,6 @@ static Janet parse_headers(const char *raw, size_t len) {
   return janet_wrap_struct(janet_table_to_struct(t));
 }
 
-/* --- Helpers --- */
-
 static char *strdup_bytes(const uint8_t *bytes, int32_t len) {
   char *s = malloc((size_t)len + 1);
   if (!s)
@@ -380,8 +364,6 @@ static const char *checked_string(Janet *argv, int32_t n, const char *what) {
     janet_panicf("%s contains an embedded NUL, CR, or LF", what);
   return (const char *)s;
 }
-
-/* --- Request construction --- */
 
 static ReqHandle *rh_new(const char *method, const char *url) {
   ReqHandle *rh = calloc(1, sizeof(ReqHandle));
@@ -551,8 +533,6 @@ static ReqHandle *req_build(const char *method, const char *url, Janet opts) {
   return rh;
 }
 
-/* --- Request dispatch --- */
-
 static JANET_NO_RETURN void start_request(ReqHandle *rh) {
   pthread_once(&g_init_once, multi_init);
 
@@ -574,8 +554,6 @@ static JANET_NO_RETURN void dispatch(const char *method, int32_t argc,
   start_request(req_build(method, checked_string(argv, 0, "url"),
                           argc > 1 ? argv[1] : janet_wrap_nil()));
 }
-
-/* --- Janet C functions --- */
 
 static Janet cfun_request(int32_t argc, Janet *argv) {
   janet_arity(argc, 2, 3);
