@@ -64,6 +64,11 @@
             {:user-agent "test-agent/1.0"})]
   (assert (string/find "test-agent" (res :body)) "custom user-agent was sent"))
 
+# The default user-agent is curl/<version>, not a static library-specific
+# string that would fingerprint this client.
+(let [res (http/get "https://httpbin.org/user-agent")]
+  (assert (string/find "curl/" (res :body)) "default user-agent is curl/<version>"))
+
 (let [res (http/get "https://httpbin.org/redirect/3")]
   (assert (= 200 (res :status)) "follows redirects by default"))
 
@@ -81,6 +86,16 @@
               ([_] false))]
   (assert (not ok) "redirect to a non-http(s) scheme is rejected"))
 
+# curl reports every hop's headers to the callback, so a followed redirect must
+# still surface the final response's headers, not the intermediate hop's. The
+# 302 here carries no X-Final-Header; the destination sets it.
+(let [res (http/get (string "https://httpbin.org/redirect-to"
+                            "?url=https%3A%2F%2Fhttpbin.org%2Fresponse-headers"
+                            "%3FX-Final-Header%3Dyes&status_code=302"))]
+  (assert (= 200 (res :status)) "redirect chain completes")
+  (assert (= "yes" ((res :headers) "x-final-header"))
+          "headers are the final response's, not the redirect's"))
+
 (let [res (http/get "https://httpbin.org/basic-auth/user/pass"
             {:username "user" :password "pass"})]
   (assert (= 200 (res :status)) "basic auth succeeds with correct credentials"))
@@ -88,6 +103,23 @@
 (let [res (http/get "https://httpbin.org/basic-auth/user/pass"
             {:username "user" :password "wrong"})]
   (assert (= 401 (res :status)) "basic auth fails with wrong credentials"))
+
+# :max-response-size rejects an over-large body, whether the size is known up
+# front (Content-Length) or discovered as the body streams in (chunked).
+(let [ok (try (do (http/get "https://httpbin.org/bytes/100000"
+                    {:max-response-size 1024})
+                  true)
+              ([_] false))]
+  (assert (not ok) "response over :max-response-size (Content-Length) is rejected"))
+
+(let [ok (try (do (http/get "https://httpbin.org/stream-bytes/100000"
+                    {:max-response-size 1024})
+                  true)
+              ([_] false))]
+  (assert (not ok) "response over :max-response-size (streamed) is rejected"))
+
+(let [res (http/get "https://httpbin.org/bytes/512" {:max-response-size 100000})]
+  (assert (= 200 (res :status)) "response within :max-response-size succeeds"))
 
 # ---------------------------------------------------------------------------
 # status codes
@@ -185,6 +217,21 @@
                   true)
               ([_] false))]
   (assert (not ok) "user-agent with embedded NUL is rejected"))
+
+# Basic-auth credentials reach libcurl as C strings, so a NUL would silently
+# truncate them.
+(let [ok (try (do (http/get "https://example.com" {:username "us\x00er"}) true)
+              ([_] false))]
+  (assert (not ok) "username with embedded NUL is rejected"))
+
+(let [ok (try (do (http/get "https://example.com" {:password "pa\x00ss"}) true)
+              ([_] false))]
+  (assert (not ok) "password with embedded NUL is rejected"))
+
+# A negative max-redirects would otherwise tell curl to follow without limit.
+(let [ok (try (do (http/get "https://example.com" {:max-redirects -1}) true)
+              ([_] false))]
+  (assert (not ok) "negative max-redirects is rejected"))
 
 (assert (= "" (http/url-encode @""))
         "url-encode of an empty buffer is an empty string")

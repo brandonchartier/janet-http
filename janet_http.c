@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <janet.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
@@ -13,11 +14,16 @@
 typedef struct {
   char *data;
   size_t len;
+  size_t max; /* cap on accumulated bytes; 0 means unlimited */
 } Buf;
 
 static size_t buf_append(char *ptr, size_t size, size_t nmemb, void *ud) {
   Buf *buf = (Buf *)ud;
   size_t n = size * nmemb;
+  /* Returning a short count aborts the transfer (curl reports CURLE_WRITE_ERROR).
+     This bounds memory against a server that streams an unbounded response. */
+  if (buf->max && buf->len + n > buf->max)
+    return 0;
   char *tmp = realloc(buf->data, buf->len + n + 1);
   if (!tmp)
     return 0;
@@ -42,6 +48,7 @@ typedef struct {
   char *username;
   char *password;
   int keep_alive;
+  size_t max_response_size;
   struct curl_slist *req_headers;
   long status;
   Buf body_buf;
@@ -111,13 +118,20 @@ static int socket_cb(CURL *easy, curl_socket_t s, int what, void *userp,
   return 0;
 }
 
+/* Nudge the curl thread to re-evaluate its handles. Fire-and-forget: the pipe
+   is non-blocking, so a full pipe (a wakeup already pending) just yields EAGAIN
+   and the thread also polls at least once a second as a backstop. */
+static void wake_curl_thread(int fd) {
+  char byte = 0;
+  ssize_t w = write(fd, &byte, 1);
+  (void)w;
+}
+
 static int timer_cb(CURLM *multi, long timeout_ms, void *userp) {
   (void)multi;
   (void)timeout_ms;
   MultiState *ms = (MultiState *)userp;
-  char byte = 0;
-  /* Fire-and-forget: if the pipe is full the thread is already active. */
-  write(ms->wakeup_pipe[1], &byte, 1);
+  wake_curl_thread(ms->wakeup_pipe[1]);
   return 0;
 }
 
@@ -274,77 +288,75 @@ static void on_complete(JanetEVGenericMessage msg) {
 
 /* --- Header parsing --- */
 
-static int count_header_lines(const char *p, const char *end) {
-  int count = 0;
-  const char *scan = p;
-  while (scan < end) {
-    const char *nl = memchr(scan, '\n', end - scan);
-    if (!nl)
-      break;
-    size_t line_len = nl - scan;
-    if (line_len > 0 && scan[line_len - 1] == '\r')
-      line_len--;
-    if (line_len == 0)
-      break;
-    if (memchr(scan, ':', line_len))
-      count++;
-    scan = nl + 1;
-  }
-  return count;
+/* Length of the line at scan, excluding any trailing CRLF/LF, and advance
+   *next past the newline (or to end for the final line). */
+static size_t next_line(const char *scan, const char *end, const char **next) {
+  const char *nl = memchr(scan, '\n', end - scan);
+  size_t len = nl ? (size_t)(nl - scan) : (size_t)(end - scan);
+  if (len > 0 && scan[len - 1] == '\r')
+    len--;
+  *next = nl ? nl + 1 : end;
+  return len;
 }
 
-static Janet parse_headers(const char *raw, size_t len) {
-  const char *p = raw;
-  const char *end = raw + len;
+/* A status line ("HTTP/1.1 200 OK") marks the start of a response. */
+static int is_status_line(const char *line, size_t len) {
+  return len >= 5 && memcmp(line, "HTTP/", 5) == 0;
+}
 
-  while (p < end && *p != '\n')
-    p++;
-  if (p < end)
-    p++;
+/* Lowercased copy of [p, p+len) as a Janet string. */
+static Janet lower_string(const char *p, size_t len) {
+  uint8_t *buf = janet_string_begin((int32_t)len);
+  for (size_t i = 0; i < len; i++)
+    buf[i] = (uint8_t)(p[i] >= 'A' && p[i] <= 'Z' ? p[i] + 32 : p[i]);
+  return janet_wrap_string(janet_string_end(buf));
+}
 
-  JanetKV *st = janet_struct_begin(count_header_lines(p, end));
-  const char *scan = p;
-  while (scan < end) {
-    const char *nl = memchr(scan, '\n', end - scan);
-    if (!nl)
-      break;
-    size_t line_len = nl - scan;
-    if (line_len > 0 && scan[line_len - 1] == '\r')
-      line_len--;
-    if (line_len == 0) {
-      scan = nl + 1;
-      break;
-    }
-
-    const char *colon = memchr(scan, ':', line_len);
-    if (colon && colon > scan) {
-      size_t klen = colon - scan;
-      const char *vstart = colon + 1;
-      size_t vlen = line_len - klen - 1;
-      while (vlen > 0 && *vstart == ' ') {
-        vstart++;
-        vlen--;
-      }
-      char *kbuf = malloc(klen);
-      for (size_t i = 0; i < klen; i++)
-        kbuf[i] =
-            (char)(scan[i] >= 'A' && scan[i] <= 'Z' ? scan[i] + 32 : scan[i]);
-      janet_struct_put(
-          st,
-          janet_wrap_string(janet_string((const uint8_t *)kbuf, (int32_t)klen)),
-          janet_wrap_string(
-              janet_string((const uint8_t *)vstart, (int32_t)vlen)));
-      free(kbuf);
-    }
-    scan = nl + 1;
+/* Parse one "Name: Value" header line into t, lowercasing the name and
+   trimming leading spaces from the value. Lines with no name or no colon
+   (blank lines, the status line) are ignored. */
+static void put_header_line(JanetTable *t, const char *line, size_t len) {
+  const char *colon = memchr(line, ':', len);
+  if (!colon || colon == line)
+    return;
+  size_t klen = (size_t)(colon - line);
+  const char *vstart = colon + 1;
+  size_t vlen = len - klen - 1;
+  while (vlen > 0 && *vstart == ' ') {
+    vstart++;
+    vlen--;
   }
-  return janet_wrap_struct(janet_struct_end(st));
+  janet_table_put(t, lower_string(line, klen),
+                  janet_wrap_string(
+                      janet_string((const uint8_t *)vstart, (int32_t)vlen)));
+}
+
+/* curl hands the header callback every hop's headers, so a followed redirect
+   leaves several "HTTP/... <headers> <blank line>" blocks in the buffer.
+   Resetting on each status line keeps only the final response's headers;
+   duplicate names within a response keep the last value (puts overwrite). */
+static Janet parse_headers(const char *raw, size_t len) {
+  const char *end = raw + len;
+  const char *scan = raw;
+  JanetTable *t = janet_table(8);
+  while (scan < end) {
+    const char *next;
+    size_t line_len = next_line(scan, end, &next);
+    if (is_status_line(scan, line_len))
+      janet_table_clear(t);
+    else
+      put_header_line(t, scan, line_len);
+    scan = next;
+  }
+  return janet_wrap_struct(janet_table_to_struct(t));
 }
 
 /* --- Helpers --- */
 
 static char *strdup_bytes(const uint8_t *bytes, int32_t len) {
   char *s = malloc((size_t)len + 1);
+  if (!s)
+    janet_panic("out of memory");
   memcpy(s, bytes, len);
   s[len] = '\0';
   return s;
@@ -373,6 +385,8 @@ static const char *checked_string(Janet *argv, int32_t n, const char *what) {
 
 static ReqHandle *rh_new(const char *method, const char *url) {
   ReqHandle *rh = calloc(1, sizeof(ReqHandle));
+  if (!rh)
+    janet_panic("out of memory");
   rh->easy = curl_easy_init();
   if (!rh->easy) {
     free(rh);
@@ -380,11 +394,50 @@ static ReqHandle *rh_new(const char *method, const char *url) {
   }
   rh->url = strdup(url);
   rh->method = strdup(method);
+  /* Default User-Agent of "curl/<version>" derived from the linked libcurl:
+     blends into the most common automated-client traffic and satisfies servers
+     that reject a missing UA, without fingerprinting this library. Overridden
+     by :user-agent. */
+  const curl_version_info_data *ver = curl_version_info(CURLVERSION_NOW);
+  char ua[64];
+  snprintf(ua, sizeof(ua), "curl/%s", ver && ver->version ? ver->version : "");
+  rh->user_agent = strdup(ua);
+  if (!rh->url || !rh->method || !rh->user_agent) {
+    rh_free(rh);
+    janet_panic("out of memory");
+  }
   rh->follow_redirects = 1;
   rh->max_redirects = 50;
-  rh->user_agent = strdup("janet http client");
   rh->keep_alive = 1;
+  /* max_response_size stays 0 (unlimited) unless the caller sets
+     :max-response-size; response headers are bounded by libcurl itself. */
   return rh;
+}
+
+/* Read a non-negative number option, returning `fallback` if it is absent. */
+static double opt_nonneg(Janet opts, const char *key, double fallback) {
+  Janet v = janet_get(opts, janet_ckeywordv(key));
+  if (!janet_checktype(v, JANET_NUMBER))
+    return fallback;
+  double n = janet_unwrap_number(v);
+  if (n < 0)
+    janet_panicf("%s must be non-negative", key);
+  return n;
+}
+
+/* Copy a string option into *dst (freeing any previous value), rejecting an
+   embedded NUL/CR/LF that could truncate the value or inject a header line.
+   Leaves *dst untouched if the option is absent. */
+static void opt_checked_dup(Janet opts, const char *key, char **dst) {
+  const uint8_t *bytes;
+  int32_t len;
+  Janet v = janet_get(opts, janet_ckeywordv(key));
+  if (!janet_bytes_view(v, &bytes, &len))
+    return;
+  if (has_ctl_chars(bytes, len))
+    janet_panicf("%s contains an embedded NUL, CR, or LF", key);
+  free(*dst);
+  *dst = strdup_bytes(bytes, len);
 }
 
 static void rh_apply_opts(ReqHandle *rh, Janet opts) {
@@ -410,31 +463,21 @@ static void rh_apply_opts(ReqHandle *rh, Janet opts) {
   if (!janet_checktype(v, JANET_NIL))
     rh->follow_redirects = janet_truthy(v);
 
-  v = janet_get(opts, janet_ckeywordv("max-redirects"));
-  if (janet_checktype(v, JANET_NUMBER))
-    rh->max_redirects = (long)janet_unwrap_number(v);
+  /* A negative max-redirects would tell curl to follow redirects without
+     limit; opt_nonneg rejects it. */
+  rh->max_redirects = (long)opt_nonneg(opts, "max-redirects", rh->max_redirects);
+  rh->max_response_size =
+      (size_t)opt_nonneg(opts, "max-response-size", (double)rh->max_response_size);
 
-  v = janet_get(opts, janet_ckeywordv("user-agent"));
-  if (janet_bytes_view(v, &bytes, &blen)) {
-    /* CURLOPT_USERAGENT becomes a request header; reject NUL/CR/LF so a
-       caller-supplied user agent cannot truncate it or inject header lines. */
-    if (has_ctl_chars(bytes, blen))
-      janet_panic("user-agent contains an embedded NUL, CR, or LF");
-    free(rh->user_agent);
-    rh->user_agent = strdup_bytes(bytes, blen);
-  }
+  /* user-agent and the basic-auth credentials all become C strings handed to
+     libcurl, so each is NUL/CR/LF-checked. */
+  opt_checked_dup(opts, "user-agent", &rh->user_agent);
+  opt_checked_dup(opts, "username", &rh->username);
+  opt_checked_dup(opts, "password", &rh->password);
 
   v = janet_get(opts, janet_ckeywordv("keep-alive"));
   if (!janet_checktype(v, JANET_NIL))
     rh->keep_alive = janet_truthy(v);
-
-  v = janet_get(opts, janet_ckeywordv("username"));
-  if (janet_bytes_view(v, &bytes, &blen))
-    rh->username = strdup_bytes(bytes, blen);
-
-  v = janet_get(opts, janet_ckeywordv("password"));
-  if (janet_bytes_view(v, &bytes, &blen))
-    rh->password = strdup_bytes(bytes, blen);
 
   v = janet_get(opts, janet_ckeywordv("headers"));
   if (janet_indexed_view(v, &items, &items_len)) {
@@ -471,6 +514,13 @@ static void rh_configure_curl(ReqHandle *rh) {
   curl_easy_setopt(rh->easy, CURLOPT_WRITEDATA, &rh->body_buf);
   curl_easy_setopt(rh->easy, CURLOPT_HEADERFUNCTION, buf_append);
   curl_easy_setopt(rh->easy, CURLOPT_HEADERDATA, &rh->headers_buf);
+  /* Bound the response body. buf_append enforces the cap as data streams in
+     (covering chunked responses); MAXFILESIZE rejects an honest Content-Length
+     up front. The header buffer is left to libcurl's own header-size limit. */
+  rh->body_buf.max = rh->max_response_size;
+  if (rh->max_response_size > 0)
+    curl_easy_setopt(rh->easy, CURLOPT_MAXFILESIZE_LARGE,
+                     (curl_off_t)rh->max_response_size);
   curl_easy_setopt(rh->easy, CURLOPT_FOLLOWLOCATION,
                    (long)rh->follow_redirects);
   curl_easy_setopt(rh->easy, CURLOPT_MAXREDIRS, rh->max_redirects);
@@ -514,8 +564,7 @@ static JANET_NO_RETURN void start_request(ReqHandle *rh) {
   curl_multi_add_handle(g_ms.multi, rh->easy);
   pthread_mutex_unlock(&g_ms.lock);
 
-  char byte = 0;
-  write(g_ms.wakeup_pipe[1], &byte, 1);
+  wake_curl_thread(g_ms.wakeup_pipe[1]);
 
   janet_await();
 }
@@ -634,14 +683,15 @@ static const JanetReg cfuns[] = {
      "Perform an arbitrary HTTP request. method is a string (\"GET\", "
      "\"POST\", etc.).\n"
      "options is an optional table or struct:\n"
-     "  :body            string or buffer - request body\n"
-     "  :headers         array of \"Key: Value\" strings\n"
+     "  :body              string or buffer - request body\n"
+     "  :headers           array of \"Key: Value\" strings\n"
      "  :follow-redirects  boolean (default true)\n"
-     "  :max-redirects   integer (default 50)\n"
-     "  :user-agent      string (default \"janet http client\")\n"
-     "  :keep-alive      boolean (default true)\n"
-     "  :username        string - basic auth\n"
-     "  :password        string - basic auth\n"
+     "  :max-redirects     integer (default 50)\n"
+     "  :max-response-size integer - cap on response body bytes (0 = no cap)\n"
+     "  :user-agent        string (default \"curl/<version>\")\n"
+     "  :keep-alive        boolean (default true)\n"
+     "  :username          string - basic auth\n"
+     "  :password          string - basic auth\n"
      "Returns @{:status n :body string :headers struct}."},
     {"get", cfun_get, "(http/get url &opt options)\n\nGET url."},
     {"post", cfun_post,

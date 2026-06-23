@@ -31,7 +31,8 @@ raise an error on the calling fiber; HTTP error codes (4xx, 5xx) are returned
 normally as `:status`.
 
 Response headers are lowercased (`"content-type"`, not `"Content-Type"`).
-Duplicate header names take the last value.
+Duplicate header names take the last value. When a redirect is followed, the
+headers are those of the final response.
 
 ### `(http/get url &opt options)`
 ### `(http/post url &opt options)`
@@ -50,7 +51,8 @@ table or struct:
 | `:headers` | array of strings | — | e.g. `["Content-Type: application/json"]` |
 | `:follow-redirects` | boolean | `true` | Follow 3xx redirects |
 | `:max-redirects` | integer | `50` | Redirect limit |
-| `:user-agent` | string | `"janet http client"` | User-Agent header |
+| `:max-response-size` | integer | `0` | Cap on response body bytes (`0` = no cap) |
+| `:user-agent` | string | `curl/<version>` | User-Agent header |
 | `:keep-alive` | boolean | `true` | TCP keep-alive |
 | `:username` | string | — | Basic auth username |
 | `:password` | string | — | Basic auth password |
